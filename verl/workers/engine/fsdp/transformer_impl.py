@@ -583,6 +583,12 @@ class FSDPEngine(BaseEngine):
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
 
+        # nlpt: apply the layer plan before FSDP flattens parameters and before the
+        # optimizer is built. Without this, C2/C3/SFT would silently train all layers.
+        from nlpt.train.verl_patch import apply_layer_plan
+
+        apply_layer_plan(module)
+
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
         if self.rank == 0:
