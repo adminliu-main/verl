@@ -139,6 +139,10 @@ class ServerAdapter(BaseRollout):
         local_rank = self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        # Monotonic counter appended to the ZMQ path on every weight-sync round,
+        # so a stale receiver socket from a previous (or crashed) round can never
+        # match the new round's path and steal interleaved messages.
+        self._weight_sync_round = 0
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
@@ -219,15 +223,18 @@ class ServerAdapter(BaseRollout):
         )
         start_time = time.time()
 
+        self._weight_sync_round += 1
+        round_zmq_handle = f"{self.zmq_handle}.round-{self._weight_sync_round}"
+
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs={**kwargs, "use_shm": self.use_shm, "sync_round": self._weight_sync_round},
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(
-            zmq_handle=self.zmq_handle,
+            zmq_handle=round_zmq_handle,
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )

@@ -229,7 +229,9 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, sync_round: int = None
+    ):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
@@ -278,8 +280,14 @@ class vLLMColocateWorkerExtension:
                 patch_vllm_moe_model_weight_loader(model)
 
         # =========================== step 2: receive weights and update ===========================
+        zmq_handle = self._get_zmq_handle()
+        if sync_round is not None:
+            # Must match the sender side in vllm_rollout.update_weights: every sync
+            # round uses its own socket path so stale peers from earlier rounds
+            # cannot interleave with this one.
+            zmq_handle = f"{zmq_handle}.round-{sync_round}"
         receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_zmq_handle(),
+            zmq_handle=zmq_handle,
             device=self.device,
             use_shm=use_shm,
         )
