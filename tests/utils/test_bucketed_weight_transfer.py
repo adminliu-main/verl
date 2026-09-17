@@ -18,11 +18,17 @@ and because CUDA IPC requires distinct processes.
 """
 
 import asyncio
+import importlib.util
 import multiprocessing as mp
+import os
+import sys
+import types
 import uuid
+from pathlib import Path
 
 import pytest
 import torch
+import zmq
 
 from verl.utils.device import get_device_name, get_torch_device, is_support_ipc
 
@@ -32,6 +38,22 @@ PROCESS_TIMEOUT = 60
 # which would make subsequent fork-based multiprocessing in other tests unsafe.
 HAS_ACCELERATOR = get_device_name() != "cpu"
 HAS_CUDA = "cuda" in get_device_name()
+_BUCKETED_WEIGHT_TRANSFER_MODULE = "verl_bucketed_weight_transfer_test_module"
+_BUCKETED_WEIGHT_TRANSFER_PATH = (
+    Path(__file__).parents[2] / "verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py"
+)
+
+
+def _load_bucketed_weight_transfer_module():
+    """Load the transfer module without importing the optional vLLM rollout package."""
+    module = sys.modules.get(_BUCKETED_WEIGHT_TRANSFER_MODULE)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(_BUCKETED_WEIGHT_TRANSFER_MODULE, _BUCKETED_WEIGHT_TRANSFER_PATH)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_BUCKETED_WEIGHT_TRANSFER_MODULE] = module
+        spec.loader.exec_module(module)
+    return module
 
 
 def _unique_zmq_handle():
@@ -72,6 +94,52 @@ class _FakeSocket:
 class _FakeTorchDevice:
     def synchronize(self):
         pass
+
+
+class _TimeoutSocket:
+    def send_pyobj(self, message):
+        pass
+
+    def recv(self):
+        raise zmq.Again()
+
+
+class _MessageSocket:
+    def __init__(self, message):
+        self.message = message
+
+    def recv_pyobj(self):
+        return self.message
+
+
+class _TimeoutReceiveSocket:
+    def recv_pyobj(self):
+        raise zmq.Again()
+
+
+def _remove_ipc_socket(zmq_handle):
+    """Remove the filesystem entry for a temporary IPC endpoint, if present."""
+    if zmq_handle.startswith("ipc://"):
+        try:
+            os.remove(zmq_handle.removeprefix("ipc://"))
+        except FileNotFoundError:
+            pass
+
+
+def _stub_ensure_async_iterator(monkeypatch):
+    """Avoid importing rollout's optional HTTP/vLLM dependencies in unit tests."""
+    module = types.ModuleType("verl.workers.rollout.utils")
+
+    async def ensure_async_iterator(iterable):
+        if hasattr(iterable, "__aiter__"):
+            async for item in iterable:
+                yield item
+        else:
+            for item in iterable:
+                yield item
+
+    module.ensure_async_iterator = ensure_async_iterator
+    monkeypatch.setitem(sys.modules, "verl.workers.rollout.utils", module)
 
 
 def test_sender_accepts_strided_tensor(monkeypatch):
@@ -117,6 +185,95 @@ def test_sender_accepts_strided_tensor(monkeypatch):
     assert buffer.dtype == torch.uint8
     assert buffer.numel() == weight.nbytes
     assert torch.equal(recovered, weight)
+
+
+def test_unique_zmq_endpoint_isolates_stale_receiver():
+    """A receiver connected to an old endpoint cannot consume a new round's request."""
+    old_handle = _unique_zmq_handle()
+    new_handle = _unique_zmq_handle()
+    context = zmq.Context()
+    old_sender = context.socket(zmq.REQ)
+    stale_receiver = context.socket(zmq.REP)
+    new_sender = context.socket(zmq.REQ)
+    new_receiver = context.socket(zmq.REP)
+
+    for socket in (old_sender, stale_receiver, new_sender, new_receiver):
+        socket.linger = 0
+    new_sender.rcvtimeo = 1000
+    new_receiver.rcvtimeo = 1000
+
+    try:
+        old_sender.bind(old_handle)
+        stale_receiver.connect(old_handle)
+        new_sender.bind(new_handle)
+        new_receiver.connect(new_handle)
+
+        new_sender.send(b"new-round-init")
+        assert new_receiver.recv() == b"new-round-init"
+        new_receiver.send(b"ack")
+        assert new_sender.recv() == b"ack"
+
+        assert stale_receiver.poll(timeout=100) == 0
+    finally:
+        for socket in (new_receiver, new_sender, stale_receiver, old_sender):
+            socket.close()
+        context.term()
+        _remove_ipc_socket(old_handle)
+        _remove_ipc_socket(new_handle)
+
+
+def test_sender_timeout_reports_protocol_desync(monkeypatch):
+    """A missing receiver ACK fails loudly instead of blocking the trainer forever."""
+    bucketed_weight_transfer = _load_bucketed_weight_transfer_module()
+    _stub_ensure_async_iterator(monkeypatch)
+
+    socket = _TimeoutSocket()
+    sender = bucketed_weight_transfer.BucketedWeightSender(
+        zmq_handle="ipc:///tmp/test-bwt-timeout.sock", bucket_size_mb=1, use_shm=True
+    )
+    monkeypatch.setattr(sender, "_init_socket", lambda: setattr(sender, "socket", socket))
+    monkeypatch.setattr(sender, "_init_buffer", lambda: setattr(sender, "buffer", torch.empty(4, dtype=torch.uint8)))
+    monkeypatch.setattr(sender, "_cleanup", lambda: None)
+    monkeypatch.setattr(bucketed_weight_transfer, "get_torch_device", lambda: _FakeTorchDevice())
+    monkeypatch.setattr(bucketed_weight_transfer, "ZMQ_WEIGHT_SYNC_TIMEOUT_MS", 1000)
+
+    with pytest.raises(RuntimeError, match="sender timed out after 1s.*likely desynced"):
+        asyncio.run(sender.async_send_weights(iter([("weight", torch.ones(1))])))
+
+
+def test_receiver_timeout_reports_protocol_desync(monkeypatch):
+    """A missing sender message fails loudly instead of blocking the rollout worker forever."""
+    bucketed_weight_transfer = _load_bucketed_weight_transfer_module()
+    receiver = bucketed_weight_transfer.BucketedWeightReceiver(
+        zmq_handle="ipc:///tmp/test-bwt-timeout.sock", device=torch.device("cpu"), use_shm=True
+    )
+    socket = _TimeoutReceiveSocket()
+    monkeypatch.setattr(receiver, "_init_socket", lambda: setattr(receiver, "socket", socket))
+    monkeypatch.setattr(receiver, "_cleanup", lambda: None)
+    monkeypatch.setattr(bucketed_weight_transfer, "ZMQ_WEIGHT_SYNC_TIMEOUT_MS", 1000)
+
+    with pytest.raises(RuntimeError, match="receiver timed out after 1s.*likely desynced"):
+        receiver.receive_weights(lambda weights, is_last: None)
+
+
+@pytest.mark.parametrize(
+    ("use_shm", "message", "expected_error"),
+    [
+        (False, {"bucket_meta": {}}, "expected IPC handle"),
+        (True, ("not", "shm metadata"), "expected shm metadata"),
+    ],
+)
+def test_receiver_init_rejects_desynced_metadata(use_shm, message, expected_error):
+    """Both initialization wire formats reject a message from the wrong protocol phase."""
+    BucketedWeightReceiver = _load_bucketed_weight_transfer_module().BucketedWeightReceiver
+
+    receiver = BucketedWeightReceiver(
+        zmq_handle="ipc:///tmp/test-bwt-desync.sock", device=torch.device("cpu"), use_shm=use_shm
+    )
+    receiver.socket = _MessageSocket(message)
+
+    with pytest.raises(TypeError, match=expected_error):
+        receiver._init_buffer()
 
 
 # ---------------------------------------------------------------------------
