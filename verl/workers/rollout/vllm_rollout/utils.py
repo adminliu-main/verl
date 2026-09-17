@@ -230,7 +230,7 @@ class vLLMColocateWorkerExtension:
             patch_vllm_moe_model_weight_loader(model)
 
     def update_weights_from_ipc(
-        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, sync_round: int = None
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, sync_round: str = None
     ):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver

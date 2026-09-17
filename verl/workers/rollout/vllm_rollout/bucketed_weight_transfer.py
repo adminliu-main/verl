@@ -354,6 +354,14 @@ class BucketedWeightReceiver:
             buffer = rebuild_ipc(handle, self.device.index)
             assert buffer.dtype == torch.uint8
         else:
+            if not isinstance(comm_metadata, dict) or "name" not in comm_metadata or "size" not in comm_metadata:
+                raise TypeError(
+                    f"weight sync protocol desync on {self.zmq_handle}: expected shm metadata "
+                    f"(dict with 'name' and 'size') in init phase, got "
+                    f"{type(comm_metadata).__name__}: {str(comm_metadata)[:200]!r}. A "
+                    f"stale/duplicate peer likely consumed part of the stream; restart from "
+                    f"the latest checkpoint."
+                )
             shm_name = comm_metadata["name"]
             shm_size = comm_metadata["size"]
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
