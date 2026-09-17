@@ -29,6 +29,7 @@ When working with Megatron:
 import logging
 import os
 import time
+import uuid
 from typing import Any, Generator, Optional
 
 import ray
@@ -219,15 +220,22 @@ class ServerAdapter(BaseRollout):
         )
         start_time = time.time()
 
+        # Fresh unique socket path per sync round: a stale receiver socket from a
+        # previous (or crashed) round can never match the new path and steal
+        # interleaved messages. A random token (not a counter) keeps this safe even
+        # if this rollout object is rebuilt while the vLLM server actor survives.
+        round_token = uuid.uuid4().hex
+        round_zmq_handle = f"{self.zmq_handle}.round-{round_token}"
+
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs={**kwargs, "use_shm": self.use_shm, "sync_round": round_token},
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(
-            zmq_handle=self.zmq_handle,
+            zmq_handle=round_zmq_handle,
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )

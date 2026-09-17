@@ -32,6 +32,17 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device, 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+# Timeout for every ZMQ send/recv in the weight-sync protocol. Without it a
+# desynced REQ/REP pair deadlocks silently (sender waits for an ack that never
+# comes, GPU idles at 0%). On timeout we raise loudly so the trainer crashes
+# and can be restarted from the latest checkpoint instead of hanging forever.
+ZMQ_WEIGHT_SYNC_TIMEOUT_MS = int(os.getenv("VERL_WEIGHT_SYNC_TIMEOUT_MS", str(600_000)))
+
+
+def _set_timeouts(socket: zmq.Socket) -> None:
+    socket.sndtimeo = ZMQ_WEIGHT_SYNC_TIMEOUT_MS
+    socket.rcvtimeo = ZMQ_WEIGHT_SYNC_TIMEOUT_MS
+
 
 class TensorMetadata(TypedDict):
     name: str
@@ -157,6 +168,12 @@ class BucketedWeightSender:
             get_torch_device().synchronize()
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
             self.socket.recv()
+        except zmq.Again as e:
+            raise RuntimeError(
+                f"weight sync sender timed out after {ZMQ_WEIGHT_SYNC_TIMEOUT_MS / 1000:.0f}s "
+                f"waiting for receiver ack on {self.zmq_handle}; the ZMQ stream is likely desynced "
+                f"(a stale peer from a previous round may have consumed the message)"
+            ) from e
         finally:
             self._cleanup()
 
@@ -169,6 +186,7 @@ class BucketedWeightSender:
             except OSError:
                 pass
         self.socket = self.zmq_context.socket(zmq.REQ)
+        _set_timeouts(self.socket)
         self.socket.bind(self.zmq_handle)
 
     def _init_buffer(self):
@@ -279,6 +297,13 @@ class BucketedWeightReceiver:
             # receive bucket and update weights
             while True:
                 metadata = self.socket.recv_pyobj()
+                if not isinstance(metadata, dict) or "bucket_meta" not in metadata:
+                    raise TypeError(
+                        f"weight sync protocol desync on {self.zmq_handle}: expected a dict with "
+                        f"'bucket_meta' in bucket phase, got {type(metadata).__name__}: "
+                        f"{str(metadata)[:200]!r}. A stale/duplicate peer likely consumed part of "
+                        f"the stream; restart from the latest checkpoint."
+                    )
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
@@ -298,12 +323,19 @@ class BucketedWeightReceiver:
                 del weights, tensor
                 if is_last:
                     break
+        except zmq.Again as e:
+            raise RuntimeError(
+                f"weight sync receiver timed out after {ZMQ_WEIGHT_SYNC_TIMEOUT_MS / 1000:.0f}s "
+                f"waiting for sender on {self.zmq_handle}; the ZMQ stream is likely desynced "
+                f"(a stale peer from a previous round may have consumed the message)"
+            ) from e
         finally:
             self._cleanup()
 
     def _init_socket(self):
         """Initialize ZMQ REP socket and connect."""
         self.socket = self.zmq_context.socket(zmq.REP)
+        _set_timeouts(self.socket)
         self.socket.connect(self.zmq_handle)
 
     def _init_buffer(self):
@@ -311,10 +343,25 @@ class BucketedWeightReceiver:
         comm_metadata = self.socket.recv_pyobj()
         buffer, shm = None, None
         if not self.use_shm:
+            if not isinstance(comm_metadata, (tuple, list)):
+                raise TypeError(
+                    f"weight sync protocol desync on {self.zmq_handle}: expected IPC handle "
+                    f"(tuple) in init phase, got {type(comm_metadata).__name__}: "
+                    f"{str(comm_metadata)[:200]!r}. A stale/duplicate peer likely consumed part "
+                    f"of the stream; restart from the latest checkpoint."
+                )
             handle = comm_metadata
             buffer = rebuild_ipc(handle, self.device.index)
             assert buffer.dtype == torch.uint8
         else:
+            if not isinstance(comm_metadata, dict) or "name" not in comm_metadata or "size" not in comm_metadata:
+                raise TypeError(
+                    f"weight sync protocol desync on {self.zmq_handle}: expected shm metadata "
+                    f"(dict with 'name' and 'size') in init phase, got "
+                    f"{type(comm_metadata).__name__}: {str(comm_metadata)[:200]!r}. A "
+                    f"stale/duplicate peer likely consumed part of the stream; restart from "
+                    f"the latest checkpoint."
+                )
             shm_name = comm_metadata["name"]
             shm_size = comm_metadata["size"]
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
