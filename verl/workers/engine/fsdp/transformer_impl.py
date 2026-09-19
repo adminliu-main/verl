@@ -397,6 +397,23 @@ class FSDPEngine(BaseEngine):
             is_lora=self.model_config.lora_rank > 0,
         )
 
+        # nlpt: 冻结口径允许混合 requires_grad (如 decoder 层子集 + lm_head)。
+        # FSDP(use_orig_params=False) 要求每个 flatten 组内 requires_grad 一致,
+        # 必须把 embed_tokens / final norm / lm_head 各自单独包成 FSDP 单元,
+        # 否则它们会被一起摊进根组导致构建报错。全部冻结或全训的旧口径不受影响
+        # (组内本就一致), 该组合策略对非混合场景等价于原策略。
+        base_policy = auto_wrap_policy
+        _special_ids = {
+            id(m)
+            for name, m in module.named_modules()
+            if name.split(".")[-1] in ("embed_tokens", "norm", "lm_head")
+        }
+
+        def auto_wrap_policy(module, recurse, nonwrapped_numel):  # noqa: F811
+            if id(module) in _special_ids:
+                return True
+            return base_policy(module, recurse, nonwrapped_numel)
+
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)
 
