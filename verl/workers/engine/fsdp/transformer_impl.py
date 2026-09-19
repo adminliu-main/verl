@@ -402,17 +402,13 @@ class FSDPEngine(BaseEngine):
         # 必须把 embed_tokens / final norm / lm_head 各自单独包成 FSDP 单元,
         # 否则它们会被一起摊进根组导致构建报错。全部冻结或全训的旧口径不受影响
         # (组内本就一致), 该组合策略对非混合场景等价于原策略。
-        base_policy = auto_wrap_policy
-        _special_ids = {
-            id(m)
-            for name, m in module.named_modules()
-            if name.split(".")[-1] in ("embed_tokens", "norm", "lm_head")
-        }
+        from verl.utils.fsdp_utils import add_named_module_wrap_policy
 
-        def auto_wrap_policy(module, recurse, nonwrapped_numel):  # noqa: F811
-            if id(module) in _special_ids:
-                return True
-            return base_policy(module, recurse, nonwrapped_numel)
+        auto_wrap_policy = add_named_module_wrap_policy(
+            module,
+            auto_wrap_policy,
+            ("embed_tokens", "norm", "lm_head"),
+        )
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)

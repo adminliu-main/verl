@@ -165,6 +165,32 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     return auto_wrap_policy
 
 
+def add_named_module_wrap_policy(module, base_policy, names: tuple[str, ...]):
+    """Extend an FSDP policy to wrap modules whose final name is in ``names``.
+
+    ``None`` is a meaningful FSDP value: it means auto wrapping was explicitly
+    disabled. Preserve it instead of installing a callable that would later try
+    to invoke ``None`` for every non-special module.
+    """
+    if base_policy is None:
+        return None
+
+    special_ids = {
+        id(child)
+        for name, child in module.named_modules()
+        if name.split(".")[-1] in names
+    }
+    if not special_ids:
+        return base_policy
+
+    def policy(module, recurse, nonwrapped_numel):
+        if id(module) in special_ids:
+            return True
+        return base_policy(module, recurse, nonwrapped_numel)
+
+    return policy
+
+
 @torch.no_grad()
 def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
     if fsdp_version(model) == 2 or fsdp_version(model) == 0:
