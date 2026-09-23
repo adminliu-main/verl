@@ -24,7 +24,7 @@ one name resolves and only fail when none do.
 import pytest
 import torch.nn as nn
 
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy
+from verl.utils.fsdp_utils import add_named_module_wrap_policy, get_fsdp_wrap_policy
 
 
 class _RealLayer(nn.Module):
@@ -49,6 +49,15 @@ class _AllUnresolvableModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.layer = _RealLayer()
+
+
+class _SpecialModuleModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(4, 4)
+        self.norm = nn.LayerNorm(4)
+        self.lm_head = nn.Linear(4, 4)
+        self.other = nn.Linear(4, 4)
 
 
 def test_wrap_policy_skips_missing_layer_class_names(caplog):
@@ -78,3 +87,23 @@ def test_wrap_policy_explicit_config_overrides_no_split_modules():
     config = {"transformer_layer_cls_to_wrap": ["_RealLayer"]}
     policy = get_fsdp_wrap_policy(model, config=config)
     assert policy is not None
+
+
+def test_named_module_policy_preserves_explicitly_disabled_auto_wrap():
+    """``wrap_policy.disable=true`` must remain a valid FSDP configuration."""
+    model = _SpecialModuleModel()
+    assert add_named_module_wrap_policy(model, None, ("embed_tokens", "norm", "lm_head")) is None
+
+
+def test_named_module_policy_wraps_only_named_modules_in_addition_to_base_policy():
+    model = _SpecialModuleModel()
+
+    def base_policy(module, recurse, nonwrapped_numel):
+        return module is model.other
+
+    policy = add_named_module_wrap_policy(model, base_policy, ("embed_tokens", "norm", "lm_head"))
+    assert policy is not None
+    assert policy(model.embed_tokens, recurse=False, nonwrapped_numel=0)
+    assert policy(model.norm, recurse=False, nonwrapped_numel=0)
+    assert policy(model.lm_head, recurse=False, nonwrapped_numel=0)
+    assert policy(model.other, recurse=False, nonwrapped_numel=0)
